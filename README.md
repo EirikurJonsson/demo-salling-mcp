@@ -1,5 +1,13 @@
 # salling-mcp
 
+> **⚠️ Unofficial hobby project.** This is **not** made, endorsed, supported or affiliated
+> with Salling Group (Netto, føtex, Bilka, Salling) in any way. I built it for fun and to
+> learn about MCP servers. It only uses Salling Group's public developer APIs, with my own
+> free API key. "Salling Group", "Netto", "føtex" and "Bilka" are their trademarks.
+>
+> Use it at your own risk: prices, stores and opening hours may be wrong or out of date.
+> Always check with the store. Please don't contact Salling Group about this project.
+
 A hobby [MCP](https://modelcontextprotocol.io) server that lets an AI assistant talk about
 recipes, price the ingredients with the [Salling Group APIs](https://developer.sallinggroup.com),
 and point you to nearby Netto, føtex and Bilka stores (Denmark).
@@ -60,5 +68,8 @@ Tests mock all HTTP calls and never call the live API.
 
 ## Credits
 
-Data from the Salling Group APIs. Map tiles © [OpenStreetMap](https://www.openstreetmap.org/copyright)
-contributors. Not affiliated with Salling Group.
+Data from the public Salling Group APIs. Map tiles ©
+[OpenStreetMap](https://www.openstreetmap.org/copyright) contributors.
+
+This is an unofficial fun project with no connection to Salling Group. If something is
+broken, open an issue here, not with them.
