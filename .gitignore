@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+.env.*
+!.env.example
+opencode.json
+.codegraph/
+*.png
+.DS_Store
