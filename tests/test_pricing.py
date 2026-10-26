@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 from salling_mcp import pricing
 
@@ -50,6 +50,30 @@ def test_within_tolerance_falls_back_to_pack_price_with_one_size():
     assert pricing.price_summary(out)["compared_on"] == "pack price"
 
 
+def sized(pid, title, price):
+    return pricing.trim_product({"prod_id": pid, "description": title, "price": price})
+
+
+def test_apply_amount_counts_packs_and_line_totals():
+    s = pricing.price_summary([sized("a", "Oksekød 400 g", 36.0), sized("b", "Oksekød 1 kg", 95.0)])
+    pricing.apply_amount(s, "1 kg")
+    assert [(o["packs"], o["line_total"]) for o in s["options"]] == [(3, 108.0), (1, 95.0)]
+    assert pricing.shopping_total({"x": s}, "cheapest") == 108.0
+
+
+def test_apply_amount_unknown_size_or_unit_counts_one_pack():
+    s = pricing.price_summary([sized("a", "Æg", 30.0), sized("b", "Æg 500 g", 40.0)])
+    pricing.apply_amount(s, "10 stk")
+    assert [o["packs"] for o in s["options"]] == [1, 1]
+    assert all("packs_note" in o for o in s["options"])
+
+
+def test_apply_amount_unreadable_amount_leaves_options_alone():
+    s = pricing.apply_amount(pricing.price_summary([sized("a", "Persille", 10.0)]), "1 bundt")
+    assert "amount_note" in s and "packs" not in s["options"][0]
+    assert pricing.shopping_total({"x": s}) == 10.0
+
+
 def test_price_summary_picks_middle_as_suggested():
     s = pricing.price_summary([p(10), p(11), p(12)])
     assert s["cheapest"] == 10 and s["suggested"]["price"] == 11
@@ -65,10 +89,49 @@ def test_trim_store_flips_coordinates_and_reads_today():
          "address": {"street": "Vej 1", "zip": "8000", "city": "Aarhus"},
          "coordinates": [10.2, 56.1],
          "hours": [{"date": "2026-10-21", "type": "store", "open": "07", "close": "22", "closed": False}]}
-    out = pricing.trim_store(s, today=date(2026, 10, 21))
+    out = pricing.trim_store(s, now=at(2026, 10, 21, 23, 0))
     assert out["lat"] == 56.1 and out["lng"] == 10.2
     assert out["address"] == "Vej 1, 8000, Aarhus"
-    assert out["today"] == {"open": "07", "close": "22"}
+    assert out["today"] == {"open": "07:00", "close": "22:00"}
+    assert out["open_now"] is False
+
+
+def at(y, mo, d, h, mi=0):
+    return datetime(y, mo, d, h, mi, tzinfo=pricing.DK_TZ)
+
+
+def day(d, open_, close, closed=False):
+    return {"date": d, "type": "store", "open": open_, "close": close, "closed": closed}
+
+
+def test_hours_accept_iso_datetimes():
+    hours = [day("2026-10-21", "2026-10-21T08:00:00", "2026-10-21T21:30:00")]
+    assert pricing.todays_hours(hours, date(2026, 10, 21)) == {"open": "08:00", "close": "21:30"}
+    assert pricing.is_open(hours, at(2026, 10, 21, 21, 29)) is True
+    assert pricing.is_open(hours, at(2026, 10, 21, 21, 30)) is False
+    assert pricing.is_open(hours, at(2026, 10, 22, 12)) is None
+
+
+def test_is_open_handles_closing_after_midnight():
+    hours = [day("2026-10-21", "07:00", "02:00"), day("2026-10-22", "07:00", "02:00")]
+    assert pricing.is_open(hours, at(2026, 10, 21, 23)) is True
+    assert pricing.is_open(hours, at(2026, 10, 22, 1, 30)) is True   # yesterday's hours
+    assert pricing.is_open(hours, at(2026, 10, 22, 3)) is False
+
+
+def test_is_open_closed_day_and_cafe_hours_ignored():
+    hours = [day("2026-12-25", None, None, closed=True),
+             {"date": "2026-12-26", "type": "bakery", "open": "06", "close": "10"}]
+    assert pricing.is_open(hours, at(2026, 12, 25, 12)) is False
+    assert pricing.is_open(hours, at(2026, 12, 26, 8)) is None
+
+
+def test_upcoming_hours_lists_known_days_in_order():
+    hours = [day("2026-10-23", "08", "20"), day("2026-10-21", "07", "22"),
+             day("2026-10-22", None, None, closed=True)]
+    out = pricing.upcoming_hours(hours, date(2026, 10, 21), days=3)
+    assert [(d["weekday"], d.get("open"), d.get("closed")) for d in out] == [
+        ("wednesday", "07:00", None), ("thursday", None, True), ("friday", "08:00", None)]
 
 
 def test_matches_any_case_insensitive():

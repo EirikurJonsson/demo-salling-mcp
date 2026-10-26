@@ -1,8 +1,12 @@
 import math
 import re
 from collections import Counter
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
+
+DK_TZ = ZoneInfo("Europe/Copenhagen")
+WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
 # unit -> (base unit, factor to base)
 _UNITS = {"kg": ("kg", 1.0), "g": ("kg", 0.001), "gr": ("kg", 0.001),
@@ -36,6 +40,7 @@ def trim_product(p: dict) -> dict:
     if size and isinstance(out["price"], (int, float)):
         out["unit_price"] = round(out["price"] / size[0], 2)
         out["unit"] = size[1]
+        out["pack_size"] = round(size[0], 4)
     return out
 
 
@@ -81,8 +86,40 @@ def price_summary(options: list[dict]) -> dict:
     }
 
 
+def packs_needed(need: tuple[float, str], option: dict) -> int | None:
+    """Packs to buy for a needed amount, or None if the pack size is unknown or in
+    another unit. 1 kg of 400 g packs -> 3."""
+    if option.get("unit") != need[1] or not option.get("pack_size"):
+        return None
+    return max(1, math.ceil(need[0] / option["pack_size"] - 1e-9))
+
+
+def apply_amount(summary: dict, amount: str | None) -> dict:
+    if not amount or not summary.get("found"):
+        return summary
+    summary["amount"] = amount
+    need = parse_size(amount)
+    if need is None:
+        summary["amount_note"] = "Could not read the amount; each option is priced as one pack."
+        return summary
+    for option in summary["options"]:
+        packs = packs_needed(need, option)
+        option["packs"] = packs or 1
+        option["line_total"] = round(option["price"] * option["packs"], 2)
+        if packs is None:
+            option["packs_note"] = "Pack size unknown, counted as one pack."
+    return summary
+
+
+def _line_total(option: dict) -> float:
+    return option.get("line_total", option["price"])
+
+
 def shopping_total(items: dict[str, dict], key: str = "suggested") -> float:
-    return round(sum(i[key]["price"] for i in items.values() if i.get("found")), 2)
+    """Sum of the 'suggested' (or 'cheapest' = first option) pick per found item,
+    using line totals when an amount was given."""
+    picks = (i["options"][0] if key == "cheapest" else i[key] for i in items.values() if i.get("found"))
+    return round(sum(_line_total(p) for p in picks), 2)
 
 
 def trim_clearance(c: dict) -> dict:
@@ -99,14 +136,70 @@ def trim_clearance(c: dict) -> dict:
     }
 
 
+def now_dk() -> datetime:
+    return datetime.now(DK_TZ)
+
+
+def _clock(value: Any) -> time | None:
+    """'07', '07:30' or an ISO datetime like '2026-10-21T07:00:00' -> time(7, 0)."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.split("T")[-1]
+    try:
+        parts = [int(x) for x in text.split(":")[:2]]
+        return time(parts[0], parts[1] if len(parts) > 1 else 0)
+    except ValueError:
+        return None
+
+
+def _store_hours(hours: list[dict] | None) -> dict[str, dict]:
+    return {h["date"]: h for h in hours or []
+            if h.get("date") and h.get("type", "store") == "store"}
+
+
+def _day(h: dict) -> dict:
+    if h.get("closed"):
+        return {"closed": True}
+    opens, closes = _clock(h.get("open")), _clock(h.get("close"))
+    return {"open": opens.strftime("%H:%M") if opens else None,
+            "close": closes.strftime("%H:%M") if closes else None}
+
+
 def todays_hours(hours: list[dict] | None, today: date | None = None) -> dict | None:
-    today_s = (today or date.today()).isoformat()
-    for h in hours or []:
-        if h.get("date") == today_s and h.get("type", "store") == "store":
-            if h.get("closed"):
-                return {"closed": True}
-            return {"open": h.get("open"), "close": h.get("close")}
-    return None
+    h = _store_hours(hours).get((today or now_dk().date()).isoformat())
+    return _day(h) if h else None
+
+
+def upcoming_hours(hours: list[dict] | None, today: date | None = None, days: int = 7) -> list[dict]:
+    by_date, start = _store_hours(hours), today or now_dk().date()
+    out = []
+    for d in (start + timedelta(n) for n in range(days)):
+        if d.isoformat() in by_date:
+            out.append({"date": d.isoformat(), "weekday": WEEKDAYS[d.weekday()],
+                        **_day(by_date[d.isoformat()])})
+    return out
+
+
+def is_open(hours: list[dict] | None, now: datetime | None = None) -> bool | None:
+    """True/False if today's hours are known, else None. A closing time at or before
+    the opening time (e.g. 07:00-02:00) means the store closes after midnight, so at
+    01:00 yesterday's hours decide."""
+    now = now or now_dk()
+    by_date, t = _store_hours(hours), now.time().replace(tzinfo=None)
+    yesterday = by_date.get((now.date() - timedelta(1)).isoformat())
+    if yesterday and not yesterday.get("closed"):
+        y_open, y_close = _clock(yesterday.get("open")), _clock(yesterday.get("close"))
+        if y_open and y_close and y_close <= y_open and t < y_close:
+            return True
+    h = by_date.get(now.date().isoformat())
+    if not h:
+        return None
+    if h.get("closed"):
+        return False
+    opens, closes = _clock(h.get("open")), _clock(h.get("close"))
+    if opens is None or closes is None:
+        return None
+    return opens <= t < closes if closes > opens else t >= opens
 
 
 def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -141,7 +234,7 @@ def add_distance(store: dict, origin: tuple[float, float] | None) -> dict:
     return store
 
 
-def trim_store(s: dict, today: date | None = None) -> dict:
+def trim_store(s: dict, now: datetime | None = None) -> dict:
     addr = s.get("address") or {}
     coords = s.get("coordinates") or [None, None]
     out: dict[str, Any] = {
@@ -154,9 +247,13 @@ def trim_store(s: dict, today: date | None = None) -> dict:
     }
     if s.get("distance_km") is not None:
         out["distance_km"] = s["distance_km"]
-    hours = todays_hours(s.get("hours"), today)
+    now = now or now_dk()
+    hours = todays_hours(s.get("hours"), now.date())
     if hours:
         out["today"] = hours
+    open_now = is_open(s.get("hours"), now)
+    if open_now is not None:
+        out["open_now"] = open_now
     return out
 
 

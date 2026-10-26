@@ -33,11 +33,12 @@ Two main flows:
 
 ```
 src/salling_mcp/
-  server.py     # FastMCP app and tool definitions (thin)
-  client.py     # Salling Group HTTP client (all API calls live here)
-  pricing.py    # price-tolerance filtering, totals (pure functions, unit tested)
+  server.py     # MCPServer app, tool and prompt definitions (thin)
+  client.py     # Salling Group HTTP client (all API calls, retries, cache)
+  pricing.py    # price tolerance, unit prices, packs, totals, opening hours (pure, unit tested)
+  models.py     # TypedDict output schemas for the tools
   mapimage.py   # static PNG map of nearby stores (OSM tiles, small numbered dots)
-tests/
+tests/          # test_protocol.py goes through a real MCP client
 skills/salling-group-api/SKILL.md   # API reference — read before touching client.py
 ```
 
@@ -49,6 +50,12 @@ skills/salling-group-api/SKILL.md   # API reference — read before touching cli
 - Type hints and docstrings on every tool. The docstring is what the agent sees, so make it
   say when to use the tool.
 - Return compact, trimmed JSON (only fields the agent needs), not raw API responses.
+- Raise `ToolError` (or `SallingAPIError`, a subclass) for anything the agent should read.
+  MCPServer replaces the text of any other exception with "Error executing tool X".
+- Output types live in `models.py` and must use `typing_extensions.TypedDict` with
+  `extra="allow"`: on Python 3.11 `typing.TypedDict` silently removes the schema, and
+  without `extra="allow"` undeclared fields are dropped from structured output.
+- The postal code is remembered only when running over stdio (`main()`), never over HTTP.
 
 ## Secrets
 
@@ -61,4 +68,5 @@ skills/salling-group-api/SKILL.md   # API reference — read before touching cli
 uv sync                                  # install
 uv run salling-mcp                       # run the MCP server (stdio)
 uv run pytest                            # tests
+uv run ruff check src tests              # lint
 ```

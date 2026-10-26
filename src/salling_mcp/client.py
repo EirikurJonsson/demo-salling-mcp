@@ -1,18 +1,28 @@
 import asyncio
+import copy
 import os
+import time
 from typing import Any
 
 import httpx
+from mcp.server.mcpserver.exceptions import ToolError
 
 BASE_URL = "https://api.sallinggroup.com"
 
 
-class SallingAPIError(Exception):
-    pass
+class SallingAPIError(ToolError):
+    """An API failure with a message that is safe to show the agent (never the key).
+    It is a ToolError because MCPServer hides the text of any other exception."""
 
 
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_RETRY_WAIT = 5.0
+
+# Seconds a successful response is reused. Food waste stock changes during the day;
+# products and stores barely change within a chat.
+TTL_FOOD_WASTE = 300
+TTL_STABLE = 3600
+CACHE_MAX_ENTRIES = 500
 
 
 class SallingClient:
@@ -29,6 +39,7 @@ class SallingClient:
         self._limit = asyncio.Semaphore(max_concurrency)
         self._retries = retries
         self._retry_delay = retry_delay
+        self._cache: dict[tuple[str, tuple[tuple[str, Any], ...]], tuple[float, Any]] = {}
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -53,8 +64,20 @@ class SallingClient:
         async with self._limit:
             return await self._http.get(path, params=params)
 
-    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    async def _get(self, path: str, params: dict[str, Any] | None = None,
+                   ttl: float = TTL_STABLE) -> Any:
         clean = {k: v for k, v in (params or {}).items() if v is not None}
+        key = (path, tuple(sorted(clean.items())))
+        hit = self._cache.get(key)
+        if hit and hit[0] > time.monotonic():
+            return copy.deepcopy(hit[1])
+        data = await self._fetch(path, clean)
+        if len(self._cache) >= CACHE_MAX_ENTRIES:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[key] = (time.monotonic() + ttl, data)
+        return copy.deepcopy(data)
+
+    async def _fetch(self, path: str, clean: dict[str, Any]) -> Any:
         try:
             res = await self._send(path, clean)
             res.raise_for_status()
@@ -74,10 +97,11 @@ class SallingClient:
     # Food Waste
     async def food_waste(self, zip_code: str | None = None, geo: str | None = None,
                          radius: float | None = None) -> list[dict]:
-        return await self._get("/v1/food-waste/", {"zip": zip_code, "geo": geo, "radius": radius})
+        return await self._get("/v1/food-waste/", {"zip": zip_code, "geo": geo, "radius": radius},
+                               ttl=TTL_FOOD_WASTE)
 
     async def store_food_waste(self, store_id: str) -> dict:
-        return await self._get(f"/v1/food-waste/{store_id}")
+        return await self._get(f"/v1/food-waste/{store_id}", ttl=TTL_FOOD_WASTE)
 
     # Product Suggestions
     async def relevant_products(self, query: str) -> list[dict]:

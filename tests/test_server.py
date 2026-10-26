@@ -1,12 +1,14 @@
 import asyncio
+import os
+from datetime import datetime
 
 import httpx
 import pytest
 import respx
-
 from mcp.server.elicitation import AcceptedElicitation, DeclinedElicitation
+from mcp.server.mcpserver.exceptions import ToolError
 
-from salling_mcp import server
+from salling_mcp import pricing, server
 from salling_mcp.client import BASE_URL, SallingAPIError, SallingClient
 
 
@@ -14,6 +16,7 @@ from salling_mcp.client import BASE_URL, SallingAPIError, SallingClient
 def fake_client(monkeypatch):
     c = SallingClient(api_key="test-key", retry_delay=0)
     monkeypatch.setattr(server, "_client", c)
+    monkeypatch.setattr(server, "_remember_zip", True)  # as when run over stdio
     monkeypatch.setattr(server, "_saved_zip", None)
     monkeypatch.setattr(server, "_zip_centers", {})
     return c
@@ -79,7 +82,7 @@ async def test_search_stores_falls_back_to_zip_when_no_center():
 
 
 async def test_invalid_postal_code_rejected():
-    with pytest.raises(ValueError, match="postal code"):
+    with pytest.raises(ToolError, match="postal code"):
         await server.search_stores(zip_code="Nørrebrogade 1")
 
 
@@ -100,7 +103,7 @@ async def test_asks_user_for_postal_code_when_missing():
 
 
 async def test_declined_elicitation_tells_agent_to_ask():
-    with pytest.raises(ValueError, match="postnummer"):
+    with pytest.raises(ToolError, match="postnummer"):
         await server.search_stores(ctx=FakeCtx(DeclinedElicitation()))
 
 
@@ -113,7 +116,7 @@ async def test_auth_error_is_readable_and_hides_key():
 
 
 async def test_location_required():
-    with pytest.raises(ValueError, match="postnummer"):
+    with pytest.raises(ToolError, match="postnummer"):
         await server.find_food_waste()
 
 
@@ -225,6 +228,104 @@ async def test_concurrent_requests_are_capped(fake_client):
     respx.get(f"{BASE_URL}/v1/product-suggestions/relevant-products").mock(side_effect=slow)
     await server.price_ingredients([f"vare{i}" for i in range(12)])
     assert peak == 4
+
+
+@respx.mock
+async def test_price_ingredients_with_amount_counts_packs():
+    respx.get(f"{BASE_URL}/v1/product-suggestions/relevant-products").mock(
+        return_value=httpx.Response(200, json={"suggestions": [
+            {"prod_id": "1", "description": "Oksekød 500 g", "price": 45.0}]}))
+    out = await server.price_ingredients([server.Ingredient(term="oksekød", amount="1,2 kg"), "mælk"])
+    assert out["items"]["oksekød"]["suggested"]["packs"] == 3
+    assert out["total_suggested"] == 135.0 + 45.0
+
+
+@respx.mock
+async def test_postal_code_not_remembered_outside_stdio(monkeypatch):
+    monkeypatch.setattr(server, "_remember_zip", False)
+    respx.get(f"{BASE_URL}/v2/stores").mock(return_value=httpx.Response(200, json=[]))
+    out = await server.set_postal_code("8000")
+    assert out["remembered"] is False and server._saved_zip is None
+    with pytest.raises(ToolError, match="postnummer"):
+        await server.search_stores()
+
+
+@pytest.mark.parametrize("call", [
+    lambda: server.search_stores(zip_code="8000", radius_km=0),
+    lambda: server.search_stores(zip_code="8000", limit=51),
+    lambda: server.show_stores_map(zip_code="8000", limit=21),
+    lambda: server.find_food_waste(zip_code="8000", radius_km=500),
+    lambda: server.get_similar_products("1", limit=-1),
+    lambda: server.price_ingredients(["mælk"], price_tolerance=3),
+    lambda: server.price_ingredients(["  "]),
+])
+async def test_out_of_range_inputs_rejected_before_any_api_call(call):
+    with respx.mock(assert_all_called=False) as mock:
+        with pytest.raises(ToolError):
+            await call()
+        assert not mock.calls
+
+
+@respx.mock
+async def test_similar_and_bought_together_trim_and_limit():
+    items = [{"prod_id": str(i), "description": f"Vare {i} 1 l", "price": 10.0 + i, "img": "x"}
+             for i in range(5)]
+    respx.get(f"{BASE_URL}/v1/product-suggestions/similar-products").mock(
+        return_value=httpx.Response(200, json=items))
+    respx.get(f"{BASE_URL}/v1/product-suggestions/frequently-bought-together").mock(
+        return_value=httpx.Response(200, json=items))
+    similar = await server.get_similar_products("1", limit=2)
+    together = await server.get_frequently_bought_together("1", limit=3)
+    assert [p["product_id"] for p in similar["products"]] == ["0", "1"]
+    assert len(together["products"]) == 3 and "img" not in together["products"][0]
+
+
+@respx.mock
+async def test_store_food_waste_trims_store_and_offers():
+    respx.get(f"{BASE_URL}/v1/food-waste/s1").mock(return_value=httpx.Response(200, json={
+        "store": {"id": "s1", "name": "Netto", "coordinates": [10, 56]},
+        "clearances": [{"offer": {"newPrice": 5, "originalPrice": 10, "percentDiscount": 50},
+                        "product": {"description": "SKYR", "ean": "123"}}]}))
+    out = await server.get_store_food_waste("s1")
+    assert out["store"]["store_id"] == "s1"
+    assert out["clearances"][0]["new_price"] == 5 and "ean" not in out["clearances"][0]
+
+
+@respx.mock
+async def test_store_details_has_week_hours_open_now_and_distance(monkeypatch):
+    now = datetime(2026, 10, 21, 12, 0, tzinfo=pricing.DK_TZ)
+    monkeypatch.setattr(pricing, "now_dk", lambda: now)
+    monkeypatch.setattr(server, "_saved_zip", "8000")
+    monkeypatch.setattr(server, "_zip_centers", {"8000": (56.0, 10.0)})
+    respx.get(f"{BASE_URL}/v2/stores/s1").mock(return_value=httpx.Response(200, json={
+        "id": "s1", "coordinates": [10.0, 56.0], "attributes": {"parking": True, "wifi": False},
+        "hours": [{"date": "2026-10-21", "type": "store", "open": "08:00", "close": "20:00"},
+                  {"date": "2026-10-22", "type": "store", "closed": True}]}))
+    out = await server.get_store_details("s1")
+    assert out["open_now"] is True and out["distance_km"] == 0.0
+    assert [d["weekday"] for d in out["hours"]] == ["wednesday", "thursday"]
+    assert out["attributes"] == {"parking": True}
+
+
+@respx.mock
+async def test_show_stores_map_returns_image_and_saves_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "MAP_DIR", tmp_path)
+    monkeypatch.setattr(server.mapimage, "render_store_map", lambda stores, center: b"PNG")
+    old = tmp_path / "stores-1000.png"
+    old.write_bytes(b"old")
+    os.utime(old, (0, 0))
+    respx.get(f"{BASE_URL}/v2/stores").mock(return_value=httpx.Response(200, json=[
+        {"id": "a", "name": "Netto", "coordinates": [10.2, 56.1]}]))
+    image, info = await server.show_stores_map(zip_code="8000")
+    assert image.data == b"PNG" and info["stores"][0]["n"] == 1
+    assert (tmp_path / "stores-8000.png").read_bytes() == b"PNG"
+    assert not old.exists()
+
+
+async def test_lifespan_closes_the_shared_client(fake_client):
+    async with server._lifespan(server.mcp):
+        assert server.client() is fake_client
+    assert server._client is None and fake_client._http.is_closed
 
 
 async def test_tools_are_annotated():
