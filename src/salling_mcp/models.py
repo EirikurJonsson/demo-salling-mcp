@@ -27,6 +27,13 @@ class Product(TypedDict):
 
 
 @with_config(OPEN)
+class ProductRef(TypedDict):
+    product_id: str | int | None
+    title: str | None
+    price: float | None
+
+
+@with_config(OPEN)
 class DayHours(TypedDict):
     date: NotRequired[str]
     weekday: NotRequired[str]
@@ -88,6 +95,9 @@ class IngredientPrice(TypedDict):
     amount: NotRequired[str]
     amount_note: NotRequired[str]
     error: NotRequired[str]
+    searched_as: NotRequired[str]
+    other_matches: NotRequired[list[ProductRef]]
+    closest_results: NotRequired[list[ProductRef]]
 
 
 @with_config(OPEN)

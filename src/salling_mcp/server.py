@@ -67,6 +67,8 @@ BILKA_RADIUS_KM = 30
 FOOD_WASTE_RADIUS_KM = 5
 MAX_FOOD_WASTE_STORES = 3
 STORE_FETCH_PAGE = 50
+MAX_OTHER_MATCHES = 5
+MAX_FALLBACK_SEARCHES = 2
 MAX_RADIUS_KM = 50
 MAX_LIST_LIMIT = 50
 MAX_MAP_STORES = 20
@@ -150,15 +152,21 @@ async def price_ingredients(ingredients: list[str | Ingredient], price_tolerance
                             ctx: Context | None = None) -> ShoppingList:
     """Price a recipe's ingredients. Use this when the user gives a recipe or ingredient list.
 
-    Pass one short Danish product search term per ingredient, either as a plain string
-    (e.g. "løg") or with the amount the recipe needs: {"term": "hakket oksekød",
-    "amount": "1 kg"}. Amounts use g/kg/ml/dl/l/stk.
+    Pass one Danish product noun per ingredient, as plain as possible: "løg", not "gule
+    løg"; "mozzarella", not "frisk mozzarella". The search handles single nouns far better
+    than phrases. Use a plain string or add the amount the recipe needs:
+    {"term": "hakket oksekød", "amount": "1 kg"}. Amounts use g/kg/ml/dl/l/stk.
 
-    For each ingredient, returns products within `price_tolerance` (0.2 = 20%) above the
-    cheapest, a cheapest price and a 'suggested' mid-range pick. Products are compared on
-    price per kg/l/stk when pack sizes are known ('compared_on' says which). With an
-    amount, each option gets 'packs' (how many to buy) and 'line_total'; totals use those.
-    Without one, totals assume one pack of each item.
+    For each ingredient, only products whose title matches the term are priced. Returns
+    options within `price_tolerance` (0.2 = 20%) above the cheapest match, a cheapest
+    price and a 'suggested' mid-range pick. 'other_matches' lists matching products
+    outside that range (often bigger packs). 'searched_as' shows a simpler word that was
+    used when the full term matched nothing. If 'found' is false, 'closest_results' shows
+    what the search returned: retry with a different noun.
+
+    Pack sizes are usually not in the product data, so totals normally assume one pack
+    of each item; 'amount_note' says so. When sizes are known, options are compared per
+    kg/l/stk and get 'packs' and 'line_total'.
 
     If a postal code is given or already saved, also returns a suggested store (nearest
     Bilka, since prices are Bilka ToGo prices) and discounted near-expiry items matching
@@ -173,13 +181,33 @@ async def price_ingredients(ingredients: list[str | Ingredient], price_tolerance
         raise ToolError("ingredients must not be empty")
     _check_range("price_tolerance", price_tolerance, 0, 2)
 
+    async def search(term: str) -> tuple[list[dict], list[dict], list[dict]]:
+        found = [pricing.trim_product(p) for p in await client().relevant_products(term)]
+        return (*pricing.split_by_match(found, term), found)
+
     async def one(item: Ingredient) -> tuple[str, dict]:
         try:
-            raw = await client().relevant_products(item.term)
+            best, others, found = await search(item.term)
+            searched_as = item.term
+            for word in [] if best else pricing.fallback_terms(item.term)[:MAX_FALLBACK_SEARCHES]:
+                best, others, _ = await search(word)
+                if best:
+                    searched_as = word
+                    break
         except SallingAPIError as e:
             return item.term, {"found": False, "error": str(e), "options": []}
-        options = pricing.within_tolerance([pricing.trim_product(p) for p in raw], price_tolerance)
-        return item.term, pricing.apply_amount(pricing.price_summary(options), item.amount)
+        if not best:
+            return item.term, {"found": False, "options": [],
+                               "closest_results": [pricing.compact(p) for p in found[:MAX_OTHER_MATCHES]]}
+        options = pricing.within_tolerance(best, price_tolerance)
+        summary = pricing.apply_amount(pricing.price_summary(options), item.amount)
+        kept = {id(o) for o in options}
+        other = [pricing.compact(p) for p in best + others if id(p) not in kept]
+        if other:
+            summary["other_matches"] = other[:MAX_OTHER_MATCHES]
+        if searched_as != item.term:
+            summary["searched_as"] = searched_as
+        return item.term, summary
 
     terms = [w.term for w in wanted]
     area = await _resolve_zip(zip_code, ctx, ask=False) if zip_code or _remembered_zip() else None
@@ -378,11 +406,13 @@ def recipe_shopping_list(recipe: str, postal_code: str = "") -> str:
     return f"""Make a shopping list for this recipe, priced with the Salling Group tools.
 
 1. Extract the ingredients. Skip basics most kitchens have (salt, pepper, water, oil)
-   unless the user asks for them. Translate each to a short Danish search term and keep
-   the amount the recipe needs, e.g. {{"term": "hakket oksekød", "amount": "500 g"}}.
+   unless the user asks for them. Translate each to a plain Danish noun ("løg", not
+   "gule løg") and keep the amount the recipe needs, e.g.
+   {{"term": "hakket oksekød", "amount": "500 g"}}.
 2. Call price_ingredients once with all ingredients. {where}
-3. Check each item's option titles match the ingredient; retry a mismatched or missing
-   one with a different Danish term.
+3. Check each item's option titles match the ingredient. If 'found' is false, look at
+   'closest_results' and retry with a different Danish noun. If the recipe needs more
+   than a small pack, look at 'other_matches' for bigger packs.
 4. Reply with a short list: ingredient, product, packs, price. Then the total, the
    suggested store, and any matching food-waste deals nearby.
 5. Say that prices are Bilka ToGo online prices, not exact in-store prices. Only

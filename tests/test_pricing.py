@@ -81,6 +81,30 @@ def test_apply_amount_unreadable_amount_leaves_options_alone():
     assert pricing.shopping_total({"x": s}) == 10.0
 
 
+def titled(*titles):
+    return [{"title": t} for t in titles]
+
+
+def test_split_by_match_prefers_titles_starting_with_term():
+    best, other = pricing.split_by_match(titled("Rødløg", "Løg øko", "Løgismose yoghurt", "Løg"), "løg")
+    assert [p["title"] for p in best] == ["Løg øko", "Løg"]
+    assert [p["title"] for p in other] == ["Rødløg"]
+
+
+def test_split_by_match_falls_back_to_compounds_and_drops_unrelated():
+    best, other = pricing.split_by_match(
+        titled("Revet mozzarella 22% fedt", "Burrata", "Ravioli m. mozzarella"), "mozzarella")
+    assert [p["title"] for p in best] == ["Revet mozzarella 22% fedt", "Ravioli m. mozzarella"]
+    assert other == []
+    assert pricing.split_by_match(titled("Pastasauce m. løg og gulerod"), "gule løg") == ([], [])
+
+
+def test_fallback_terms_only_for_phrases():
+    assert pricing.fallback_terms("frisk mozzarella") == ["mozzarella", "frisk"]
+    assert pricing.fallback_terms("løg") == []
+    assert pricing.fallback_terms("tomater 400 g") == []
+
+
 def test_price_summary_picks_middle_as_suggested():
     s = pricing.price_summary([p(10), p(11), p(12)])
     assert s["cheapest"] == 10 and s["suggested"]["price"] == 11

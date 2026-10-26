@@ -44,6 +44,36 @@ def trim_product(p: dict) -> dict:
     return out
 
 
+def _starts_with(title: str, term: str) -> bool:
+    return re.match(rf"{re.escape(term)}(?![^\W\d_])", title) is not None
+
+
+def split_by_match(products: list[dict], term: str) -> tuple[list[dict], list[dict]]:
+    """(best matches, other relevant products) for a search term, in API order.
+
+    Best are titles that start with the term ('løg' -> 'Løg øko'). If there are none,
+    titles where the term ends a word ('Rødløg', 'Revet mozzarella') count as best.
+    Titles that do not contain the term at all ('Pastasauce m. løg' for 'gule løg') are
+    dropped, so an unrelated cheap product never sets the price range.
+    """
+    t = term.lower().strip()
+    starts = [p for p in products if _starts_with((p.get("title") or "").lower(), t)]
+    contains = [p for p in products if p not in starts and matches_any(p.get("title"), [t])]
+    return (starts, contains) if starts else (contains, [])
+
+
+def fallback_terms(term: str) -> list[str]:
+    """Single words to retry with when the full term matches nothing, last word first:
+    Danish puts the noun last ('gule løg' -> 'løg'). The API handles one noun far better
+    than phrases ('frisk mozzarella' returns ravioli)."""
+    words = [w for w in re.findall(r"[^\W\d_]+", term.lower()) if len(w) >= 3]
+    return words[::-1] if len(words) > 1 else []
+
+
+def compact(p: dict) -> dict:
+    return {"product_id": p.get("product_id"), "title": p.get("title"), "price": p.get("price")}
+
+
 def comparison_unit(products: list[dict]) -> str | None:
     """Unit to compare on ('kg', 'l', 'stk'), or None to compare pack prices.
     Unit prices are used when at least two priced products share a unit."""

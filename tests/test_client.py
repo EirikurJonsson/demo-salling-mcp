@@ -67,3 +67,27 @@ def test_missing_key_is_reported(monkeypatch):
     monkeypatch.delenv("SALLING_API_KEY", raising=False)
     with pytest.raises(SallingAPIError, match="SALLING_API_KEY is not set"):
         SallingClient()
+
+
+@respx.mock
+async def test_ip_block_stops_all_calls_until_it_ends(c, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(client_mod.time, "monotonic", lambda: now[0])
+    route = respx.get(STORES).mock(side_effect=[
+        httpx.Response(429, headers={"Retry-After": "1929"}), httpx.Response(200, json=[])])
+    with pytest.raises(SallingAPIError, match="about 33 min"):
+        await c.stores(zip="8000")
+    with pytest.raises(SallingAPIError, match="Do not retry"):
+        await c.stores(zip="8200")
+    assert route.call_count == 1  # no retries into the block, no new requests during it
+    now[0] += 1930
+    assert await c.stores(zip="8200") == []
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_short_retry_after_is_still_retried(c):
+    route = respx.get(STORES).mock(side_effect=[
+        httpx.Response(429, headers={"Retry-After": "0"}), httpx.Response(200, json=[])])
+    assert await c.stores(zip="8000") == []
+    assert route.call_count == 2

@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import math
 import os
 import time
 from typing import Any
@@ -16,7 +17,7 @@ class SallingAPIError(ToolError):
 
 
 RETRY_STATUSES = {429, 500, 502, 503, 504}
-MAX_RETRY_WAIT = 5.0
+MAX_RETRY_WAIT = 5  # seconds; a longer Retry-After is treated as a block
 
 # Seconds a successful response is reused. Food waste stock changes during the day;
 # products and stores barely change within a chat.
@@ -40,29 +41,42 @@ class SallingClient:
         self._retries = retries
         self._retry_delay = retry_delay
         self._cache: dict[tuple[str, tuple[tuple[str, Any], ...]], tuple[float, Any]] = {}
+        self._blocked_until = 0.0
 
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    def _wait(self, attempt: int, res: httpx.Response | None) -> float:
-        retry_after = res.headers.get("Retry-After", "") if res is not None else ""
-        wait = float(retry_after) if retry_after.isdigit() else self._retry_delay * 2 ** attempt
-        return min(wait, MAX_RETRY_WAIT)
+    def _rate_limited(self) -> SallingAPIError:
+        minutes = max(1, math.ceil((self._blocked_until - time.monotonic()) / 60))
+        return SallingAPIError(f"Rate limited by Salling Group API: try again in about {minutes} min. "
+                               "Do not retry before then.")
+
+    async def _get_once(self, path: str, params: dict[str, Any]) -> httpx.Response:
+        if self._blocked_until > time.monotonic():
+            raise self._rate_limited()
+        async with self._limit:
+            res = await self._http.get(path, params=params)
+        retry_after = res.headers.get("Retry-After", "")
+        if res.status_code == 429 and retry_after.isdigit() and int(retry_after) > MAX_RETRY_WAIT:
+            # A long Retry-After means the API has blocked this IP. Every request sent
+            # during the block can extend it, so stop calling until it has passed.
+            self._blocked_until = time.monotonic() + int(retry_after)
+            raise self._rate_limited()
+        return res
 
     async def _send(self, path: str, params: dict[str, Any]) -> httpx.Response:
-        """GET with retries on rate limits, 5xx and network errors (all calls are reads)."""
+        """GET with retries on short rate limits, 5xx and network errors (all calls are reads)."""
         for attempt in range(self._retries):
             try:
-                async with self._limit:
-                    res = await self._http.get(path, params=params)
+                res = await self._get_once(path, params)
             except httpx.TransportError:
-                await asyncio.sleep(self._wait(attempt, None))
+                await asyncio.sleep(self._retry_delay * 2 ** attempt)
                 continue
             if res.status_code not in RETRY_STATUSES:
                 return res
-            await asyncio.sleep(self._wait(attempt, res))
-        async with self._limit:
-            return await self._http.get(path, params=params)
+            retry_after = res.headers.get("Retry-After", "")
+            await asyncio.sleep(float(retry_after) if retry_after.isdigit() else self._retry_delay * 2 ** attempt)
+        return await self._get_once(path, params)
 
     async def _get(self, path: str, params: dict[str, Any] | None = None,
                    ttl: float = TTL_STABLE) -> Any:

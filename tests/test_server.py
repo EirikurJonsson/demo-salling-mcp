@@ -237,7 +237,48 @@ async def test_price_ingredients_with_amount_counts_packs():
             {"prod_id": "1", "description": "Oksekød 500 g", "price": 45.0}]}))
     out = await server.price_ingredients([server.Ingredient(term="oksekød", amount="1,2 kg"), "mælk"])
     assert out["items"]["oksekød"]["suggested"]["packs"] == 3
-    assert out["total_suggested"] == 135.0 + 45.0
+    assert out["total_suggested"] == 135.0
+    assert out["not_found"] == ["mælk"]  # beef is not priced as milk
+
+
+LIVE_LOEG = [("Løg", 12), ("Løg øko", 14), ("Løg", 22), ("Rødløg", 8), ("Rødløg øko", 12),
+             ("Hvidløg", 14.5), ("Bananskalotteløg", 10), ("Forårsløg i bundt", 9)]
+
+
+def suggestions(rows):
+    return httpx.Response(200, json={"suggestions": [
+        {"prod_id": str(i), "title": t, "description": t, "price": p} for i, (t, p) in enumerate(rows)]})
+
+
+@respx.mock
+async def test_cheap_other_product_does_not_push_out_the_real_match():
+    respx.get(f"{BASE_URL}/v1/product-suggestions/relevant-products").mock(return_value=suggestions(LIVE_LOEG))
+    item = (await server.price_ingredients(["løg"]))["items"]["løg"]
+    assert [o["title"] for o in item["options"]] == ["Løg", "Løg øko"]
+    assert item["other_matches"][0] == {"product_id": "2", "title": "Løg", "price": 22}
+    assert "Rødløg" in [o["title"] for o in item["other_matches"]]
+
+
+@respx.mock
+async def test_phrase_falls_back_to_single_word():
+    def handler(request):
+        q = request.url.params["query"]
+        if q == "gule løg":
+            return suggestions([("Pastasauce m. løg og gulerod", 22.25)])
+        return suggestions(LIVE_LOEG if q == "løg" else [])
+    route = respx.get(f"{BASE_URL}/v1/product-suggestions/relevant-products").mock(side_effect=handler)
+    item = (await server.price_ingredients(["gule løg"]))["items"]["gule løg"]
+    assert item["searched_as"] == "løg" and item["options"][0]["title"] == "Løg"
+    assert [c.request.url.params["query"] for c in route.calls] == ["gule løg", "løg"]
+
+
+@respx.mock
+async def test_no_match_shows_closest_results():
+    respx.get(f"{BASE_URL}/v1/product-suggestions/relevant-products").mock(
+        return_value=suggestions([("Ravioli m. tomat og ricotta", 25)]))
+    item = (await server.price_ingredients(["burrata"]))["items"]["burrata"]
+    assert item["found"] is False
+    assert item["closest_results"] == [{"product_id": "0", "title": "Ravioli m. tomat og ricotta", "price": 25}]
 
 
 @respx.mock
