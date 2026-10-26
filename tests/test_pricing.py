@@ -68,6 +68,13 @@ def test_apply_amount_unknown_size_or_unit_counts_one_pack():
     assert all("packs_note" in o for o in s["options"])
 
 
+def test_apply_amount_without_any_pack_sizes_adds_one_note():
+    s = pricing.price_summary([sized("a", "Letmælk 1,5% fedt", 11.05), sized("b", "Minimælk", 10.6)])
+    pricing.apply_amount(s, "1 l")
+    assert "not in the product data" in s["amount_note"]
+    assert all("packs" not in o and "packs_note" not in o for o in s["options"])
+
+
 def test_apply_amount_unreadable_amount_leaves_options_alone():
     s = pricing.apply_amount(pricing.price_summary([sized("a", "Persille", 10.0)]), "1 bundt")
     assert "amount_note" in s and "packs" not in s["options"][0]

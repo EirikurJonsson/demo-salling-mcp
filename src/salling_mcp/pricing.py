@@ -102,6 +102,10 @@ def apply_amount(summary: dict, amount: str | None) -> dict:
     if need is None:
         summary["amount_note"] = "Could not read the amount; each option is priced as one pack."
         return summary
+    if not any(o.get("pack_size") for o in summary["options"]):
+        summary["amount_note"] = ("Pack sizes are not in the product data, so each option is priced "
+                                  "as one pack. Check the product link for the size.")
+        return summary
     for option in summary["options"]:
         packs = packs_needed(need, option)
         option["packs"] = packs or 1
