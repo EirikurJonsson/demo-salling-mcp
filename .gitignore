@@ -10,3 +10,6 @@ opencode.json
 .codegraph/
 *.png
 .DS_Store
+
+# local agent state
+.sisyphus/
