@@ -1,3 +1,5 @@
+import asyncio
+
 import httpx
 import pytest
 import respx
@@ -10,7 +12,7 @@ from salling_mcp.client import BASE_URL, SallingAPIError, SallingClient
 
 @pytest.fixture(autouse=True)
 def fake_client(monkeypatch):
-    c = SallingClient(api_key="test-key")
+    c = SallingClient(api_key="test-key", retry_delay=0)
     monkeypatch.setattr(server, "_client", c)
     monkeypatch.setattr(server, "_saved_zip", None)
     monkeypatch.setattr(server, "_zip_centers", {})
@@ -113,3 +115,120 @@ async def test_auth_error_is_readable_and_hides_key():
 async def test_location_required():
     with pytest.raises(ValueError, match="postnummer"):
         await server.find_food_waste()
+
+
+MILK = {"suggestions": [{"prod_id": "1", "description": "Sødmælk 1 L", "price": 12.0}]}
+
+
+@respx.mock
+async def test_price_ingredients_without_postal_code_skips_stores():
+    respx.get(f"{BASE_URL}/v1/product-suggestions/relevant-products").mock(
+        return_value=httpx.Response(200, json=MILK))
+    stores = respx.get(f"{BASE_URL}/v2/stores")
+    out = await server.price_ingredients(["mælk"])
+    assert "suggested_store" not in out and not stores.called
+
+
+@respx.mock
+async def test_price_ingredients_suggests_nearest_bilka_and_food_waste():
+    respx.get(f"{BASE_URL}/v1/product-suggestions/relevant-products").mock(
+        return_value=httpx.Response(200, json=MILK))
+
+    def stores(request):
+        p = request.url.params
+        if "zip" in p:
+            return httpx.Response(200, json=[{"coordinates": [10.21, 56.16]}])
+        assert p["brand"] == "bilka"
+        return httpx.Response(200, json=[{"id": "far", "brand": "bilka", "coordinates": [10.5, 56.4]},
+                                         {"id": "near", "brand": "bilka", "coordinates": [10.22, 56.16]}])
+    respx.get(f"{BASE_URL}/v2/stores").mock(side_effect=stores)
+    respx.get(f"{BASE_URL}/v1/food-waste/").mock(return_value=httpx.Response(200, json=[{
+        "store": {"id": "n1", "coordinates": [10.21, 56.16]},
+        "clearances": [{"offer": {"newPrice": 6}, "product": {"description": "SØDMÆLK"}},
+                       {"offer": {"newPrice": 5}, "product": {"description": "AGURK"}}]}]))
+
+    out = await server.price_ingredients(["mælk"], zip_code="8000")
+    assert out["suggested_store"]["store_id"] == "near"
+    assert "Bilka" in out["suggested_store"]["why"]
+    assert [c["product"] for c in out["food_waste_matches"][0]["clearances"]] == ["SØDMÆLK"]
+    assert out["items"]["mælk"]["cheapest"] == 12.0
+
+
+@respx.mock
+async def test_price_ingredients_falls_back_to_nearest_store_without_bilka():
+    respx.get(f"{BASE_URL}/v1/product-suggestions/relevant-products").mock(
+        return_value=httpx.Response(200, json=MILK))
+
+    def stores(request):
+        p = request.url.params
+        if "zip" in p:
+            return httpx.Response(200, json=[{"coordinates": [14.9, 55.1]}])
+        if p.get("brand") == "bilka":
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json=[{"id": "netto", "brand": "netto", "coordinates": [14.9, 55.1]}])
+    respx.get(f"{BASE_URL}/v2/stores").mock(side_effect=stores)
+    respx.get(f"{BASE_URL}/v1/food-waste/").mock(return_value=httpx.Response(200, json=[]))
+
+    out = await server.price_ingredients(["mælk"], zip_code="3700")
+    assert out["suggested_store"]["store_id"] == "netto"
+    assert out["food_waste_matches"] == []
+
+
+@respx.mock
+async def test_store_lookup_failure_does_not_break_pricing():
+    respx.get(f"{BASE_URL}/v1/product-suggestions/relevant-products").mock(
+        return_value=httpx.Response(200, json=MILK))
+    respx.get(f"{BASE_URL}/v2/stores").mock(side_effect=[
+        httpx.Response(200, json=[{"coordinates": [10.21, 56.16]}]),
+        httpx.Response(403), httpx.Response(403)])
+    respx.get(f"{BASE_URL}/v1/food-waste/").mock(return_value=httpx.Response(200, json=[]))
+
+    out = await server.price_ingredients(["mælk"], zip_code="8000")
+    assert out["total_cheapest"] == 12.0 and "Not authorized" in out["store_error"]
+
+
+@respx.mock
+async def test_retries_rate_limit_then_succeeds():
+    route = respx.get(f"{BASE_URL}/v2/stores/x").mock(side_effect=[
+        httpx.Response(429, headers={"Retry-After": "0"}), httpx.Response(200, json={"id": "x"})])
+    out = await server.get_store_details("x")
+    assert out["store_id"] == "x" and route.call_count == 2
+
+
+@respx.mock
+async def test_gives_up_after_retries():
+    route = respx.get(f"{BASE_URL}/v2/stores/x").mock(return_value=httpx.Response(503))
+    with pytest.raises(SallingAPIError, match="503"):
+        await server.get_store_details("x")
+    assert route.call_count == 3
+
+
+@respx.mock
+async def test_retries_network_errors():
+    route = respx.get(f"{BASE_URL}/v2/stores/x").mock(side_effect=[
+        httpx.ConnectError("boom"), httpx.Response(200, json={"id": "x"})])
+    assert (await server.get_store_details("x"))["store_id"] == "x"
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_concurrent_requests_are_capped(fake_client):
+    active = peak = 0
+
+    async def slow(request):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return httpx.Response(200, json=MILK)
+    respx.get(f"{BASE_URL}/v1/product-suggestions/relevant-products").mock(side_effect=slow)
+    await server.price_ingredients([f"vare{i}" for i in range(12)])
+    assert peak == 4
+
+
+async def test_tools_are_annotated():
+    tools = {t.name: t.annotations for t in await server.mcp.list_tools()}
+    assert tools["set_postal_code"].read_only_hint is False
+    assert all(a.read_only_hint and a.open_world_hint
+               for name, a in tools.items() if name != "set_postal_code")

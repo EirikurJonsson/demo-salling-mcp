@@ -16,7 +16,7 @@ and point you to nearby Netto, føtex and Bilka stores (Denmark).
 
 | Tool | What it does |
 | --- | --- |
-| `price_ingredients` | Price a list of ingredients. Gives options within a price range above the cheapest (default 20%), not only the cheapest. |
+| `price_ingredients` | Price a list of ingredients. Gives options within a price range above the cheapest (default 20%), not only the cheapest. Compares price per kg/l/stk when the pack size is in the product title. With a postal code, also suggests the nearest Bilka and lists matching food-waste deals nearby. |
 | `search_products` | Search products by a Danish term (e.g. `mælk`). |
 | `get_similar_products` / `get_frequently_bought_together` | Alternatives and related products. |
 | `set_postal_code` | Remember your postal code (postnummer) for the session. |

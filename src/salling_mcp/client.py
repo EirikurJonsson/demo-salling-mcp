@@ -1,3 +1,4 @@
+import asyncio
 import os
 from typing import Any
 
@@ -10,8 +11,13 @@ class SallingAPIError(Exception):
     pass
 
 
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+MAX_RETRY_WAIT = 5.0
+
+
 class SallingClient:
-    def __init__(self, api_key: str | None = None, timeout: float = 15.0):
+    def __init__(self, api_key: str | None = None, timeout: float = 15.0,
+                 max_concurrency: int = 4, retries: int = 2, retry_delay: float = 0.5):
         key = api_key or os.getenv("SALLING_API_KEY")
         if not key:
             raise SallingAPIError("SALLING_API_KEY is not set")
@@ -20,14 +26,37 @@ class SallingClient:
             headers={"Authorization": f"Bearer {key}"},
             timeout=timeout,
         )
+        self._limit = asyncio.Semaphore(max_concurrency)
+        self._retries = retries
+        self._retry_delay = retry_delay
 
     async def aclose(self) -> None:
         await self._http.aclose()
 
+    def _wait(self, attempt: int, res: httpx.Response | None) -> float:
+        retry_after = res.headers.get("Retry-After", "") if res is not None else ""
+        wait = float(retry_after) if retry_after.isdigit() else self._retry_delay * 2 ** attempt
+        return min(wait, MAX_RETRY_WAIT)
+
+    async def _send(self, path: str, params: dict[str, Any]) -> httpx.Response:
+        """GET with retries on rate limits, 5xx and network errors (all calls are reads)."""
+        for attempt in range(self._retries):
+            try:
+                async with self._limit:
+                    res = await self._http.get(path, params=params)
+            except httpx.TransportError:
+                await asyncio.sleep(self._wait(attempt, None))
+                continue
+            if res.status_code not in RETRY_STATUSES:
+                return res
+            await asyncio.sleep(self._wait(attempt, res))
+        async with self._limit:
+            return await self._http.get(path, params=params)
+
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         clean = {k: v for k, v in (params or {}).items() if v is not None}
         try:
-            res = await self._http.get(path, params=clean)
+            res = await self._send(path, clean)
             res.raise_for_status()
         except httpx.HTTPStatusError as e:
             status = e.response.status_code

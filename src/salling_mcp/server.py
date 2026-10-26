@@ -7,6 +7,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.utilities.types import Image
+from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from salling_mcp import mapimage, pricing
@@ -18,6 +19,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 mcp = MCPServer("salling-group")
 
 _client: SallingClient | None = None
+
+READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=True)
+# Only changes this session's saved postal code; calling it twice has the same effect.
+SESSION_SETTING = ToolAnnotations(read_only_hint=False, destructive_hint=False,
+                                  idempotent_hint=True, open_world_hint=True)
 
 PRICE_NOTE = "Prices are Bilka ToGo online prices: a reference, not exact prices for a physical store."
 
@@ -32,6 +38,11 @@ def client() -> SallingClient:
 # Only the postal code is kept (in memory, for this session) — never an address.
 _saved_zip: str | None = None
 _zip_centers: dict[str, tuple[float, float] | None] = {}
+
+BILKA_RADIUS_KM = 30
+FOOD_WASTE_RADIUS_KM = 5
+MAX_FOOD_WASTE_STORES = 3
+STORE_FETCH_PAGE = 50
 
 DISTANCE_NOTE = "Distances are approximate, measured from the middle of the postal code area."
 ASK_ZIP = ("Ask the user for their Danish postal code (postnummer, e.g. '8000') "
@@ -72,7 +83,7 @@ def _geo(center: tuple[float, float]) -> str:
     return f"{center[0]:.5f},{center[1]:.5f}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=SESSION_SETTING)
 async def set_postal_code(zip_code: str, ctx: Context | None = None) -> dict:
     """Remember the user's postal code (postnummer) for this session, so store and
     food-waste searches show distances without asking again. Only the postal code is
@@ -81,19 +92,26 @@ async def set_postal_code(zip_code: str, ctx: Context | None = None) -> dict:
     return {"postal_code": z, "area_found": center is not None}
 
 
-@mcp.tool()
-async def price_ingredients(ingredients: list[str], price_tolerance: float = 0.2) -> dict:
+@mcp.tool(annotations=READ_ONLY)
+async def price_ingredients(ingredients: list[str], price_tolerance: float = 0.2,
+                            zip_code: str | None = None) -> dict:
     """Price a recipe's ingredients. Use this when the user gives a recipe or ingredient list.
 
     Pass short Danish product search terms, one per ingredient, without amounts
-    (e.g. ["hakket oksekød", "løg", "fløde"]). For each ingredient, returns products priced
-    within `price_tolerance` (0.2 = 20%) above the cheapest, a cheapest price and a
-    'suggested' mid-range pick, plus totals for the whole list.
+    (e.g. ["hakket oksekød", "løg", "fløde"]). For each ingredient, returns products within
+    `price_tolerance` (0.2 = 20%) above the cheapest, a cheapest price and a 'suggested'
+    mid-range pick, plus totals for the whole list (one pack of each item). Products are
+    compared on price per kg/l/stk when pack sizes are known ('compared_on' says which).
+
+    If a postal code is given or already saved, also returns a suggested store (nearest
+    Bilka, since prices are Bilka ToGo prices) and discounted near-expiry items matching
+    the ingredients in nearby stores.
 
     Search is fuzzy: always check option titles match the ingredient (e.g. a search for
     'parmesan' may return other cheeses) and retry with a different term if not.
     """
-    if not ingredients:
+    terms = [t.strip() for t in ingredients if t.strip()]
+    if not terms:
         raise ValueError("ingredients must not be empty")
     if not 0 <= price_tolerance <= 2:
         raise ValueError("price_tolerance must be between 0 and 2")
@@ -106,8 +124,14 @@ async def price_ingredients(ingredients: list[str], price_tolerance: float = 0.2
         options = pricing.within_tolerance([pricing.trim_product(p) for p in raw], price_tolerance)
         return term, pricing.price_summary(options)
 
-    items = dict(await asyncio.gather(*(one(t.strip()) for t in ingredients if t.strip())))
-    return {
+    area = await _resolve_zip(zip_code, None) if zip_code or _saved_zip else None
+    pricing_job = asyncio.gather(*(one(t) for t in terms))
+    if area:
+        results, stores = await asyncio.gather(pricing_job, _store_suggestion(*area, terms))
+    else:
+        results, stores = await pricing_job, None
+    items = dict(results)
+    out = {
         "items": items,
         "total_cheapest": round(sum(i["cheapest"] for i in items.values() if i.get("found")), 2),
         "total_suggested": pricing.shopping_total(items),
@@ -115,9 +139,29 @@ async def price_ingredients(ingredients: list[str], price_tolerance: float = 0.2
         "currency": "DKK",
         "note": PRICE_NOTE,
     }
+    if stores:
+        out.update(stores)
+    return out
 
 
-@mcp.tool()
+async def _store_suggestion(z: str, center: tuple[float, float] | None, terms: list[str]) -> dict:
+    try:
+        bilka, waste = await asyncio.gather(
+            _stores_near(z, center, BILKA_RADIUS_KM, "bilka", 1),
+            _food_waste_near(z, center, FOOD_WASTE_RADIUS_KM, terms))
+        if bilka:
+            suggested = {**bilka[0], "why": "Nearest Bilka: the prices above are Bilka ToGo prices."}
+        else:
+            nearest = await _stores_near(z, center, FOOD_WASTE_RADIUS_KM, None, 1)
+            suggested = ({**nearest[0], "why": "Nearest store (no Bilka nearby): prices may differ."}
+                         if nearest else None)
+    except SallingAPIError as e:
+        return {"postal_code": z, "store_error": str(e)}
+    return {"postal_code": z, "suggested_store": suggested,
+            "food_waste_matches": waste[:MAX_FOOD_WASTE_STORES], "distance_note": DISTANCE_NOTE}
+
+
+@mcp.tool(annotations=READ_ONLY)
 async def search_products(query: str, limit: int = 10) -> dict:
     """Search Bilka ToGo products by a Danish search term (e.g. 'mælk'). Use for a single
     product lookup or to browse options; use price_ingredients for a whole recipe."""
@@ -125,7 +169,7 @@ async def search_products(query: str, limit: int = 10) -> dict:
     return {"products": [pricing.trim_product(p) for p in raw[:limit]], "note": PRICE_NOTE}
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_similar_products(product_id: str, limit: int = 10) -> dict:
     """Find alternatives to a product (by product_id from another tool), e.g. a cheaper
     or organic substitute."""
@@ -133,7 +177,7 @@ async def get_similar_products(product_id: str, limit: int = 10) -> dict:
     return {"products": [pricing.trim_product(p) for p in raw[:limit]], "note": PRICE_NOTE}
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_frequently_bought_together(product_id: str, limit: int = 10) -> dict:
     """Products often bought together with a product (by product_id). Use for
     'what else might I need' suggestions."""
@@ -141,7 +185,7 @@ async def get_frequently_bought_together(product_id: str, limit: int = 10) -> di
     return {"products": [pricing.trim_product(p) for p in raw[:limit]], "note": PRICE_NOTE}
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def find_food_waste(zip_code: str | None = None, radius_km: float = 5,
                           ingredients: list[str] | None = None,
                           ctx: Context | None = None) -> dict:
@@ -151,6 +195,12 @@ async def find_food_waste(zip_code: str | None = None, radius_km: float = 5,
     sorted by approximate distance and include a map link. Optionally pass ingredient
     terms to only return matching items."""
     z, center = await _resolve_zip(zip_code, ctx)
+    stores = await _food_waste_near(z, center, radius_km, ingredients)
+    return {"postal_code": z, "stores": stores, "currency": "DKK", "note": DISTANCE_NOTE}
+
+
+async def _food_waste_near(z: str, center: tuple[float, float] | None, radius_km: float,
+                           ingredients: list[str] | None) -> list[dict]:
     if center:
         raw = await client().food_waste(geo=_geo(center), radius=radius_km)
     else:
@@ -165,10 +215,10 @@ async def find_food_waste(zip_code: str | None = None, radius_km: float = 5,
             store = pricing.add_distance(pricing.trim_store(entry.get("store", {})), center)
             stores.append({"store": store, "clearances": clearances})
     stores.sort(key=lambda e: e["store"].get("distance_km", float("inf")))
-    return {"postal_code": z, "stores": stores, "currency": "DKK", "note": DISTANCE_NOTE}
+    return stores
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_store_food_waste(store_id: str) -> dict:
     """List all discounted near-expiry items at one specific store (by store_id)."""
     raw = await client().store_food_waste(store_id)
@@ -179,20 +229,26 @@ async def get_store_food_waste(store_id: str) -> dict:
     }
 
 
-async def _nearby_stores(zip_code: str | None, radius_km: float, brand: str | None,
-                         limit: int, ctx: Context | None) -> tuple[str, tuple[float, float] | None, list[dict]]:
-    z, center = await _resolve_zip(zip_code, ctx)
+async def _stores_near(z: str, center: tuple[float, float] | None, radius_km: float,
+                       brand: str | None, limit: int) -> list[dict]:
     if center:
+        # The API does not document its sort order, so fetch a wider page and sort here.
         raw = await client().stores(geo=_geo(center), radius=radius_km, brand=brand,
-                                    country="dk", per_page=limit)
+                                    country="dk", per_page=max(limit, STORE_FETCH_PAGE))
     else:
         raw = await client().stores(zip=z, brand=brand, country="dk", per_page=limit)
     stores = [pricing.add_distance(pricing.trim_store(s), center) for s in raw]
     stores.sort(key=lambda s: s.get("distance_km", float("inf")))
-    return z, center, stores
+    return stores[:limit]
 
 
-@mcp.tool()
+async def _nearby_stores(zip_code: str | None, radius_km: float, brand: str | None,
+                         limit: int, ctx: Context | None) -> tuple[str, tuple[float, float] | None, list[dict]]:
+    z, center = await _resolve_zip(zip_code, ctx)
+    return z, center, await _stores_near(z, center, radius_km, brand, limit)
+
+
+@mcp.tool(annotations=READ_ONLY)
 async def search_stores(zip_code: str | None = None, radius_km: float = 5,
                         brand: str | None = None, limit: int = 10,
                         ctx: Context | None = None) -> dict:
@@ -204,7 +260,7 @@ async def search_stores(zip_code: str | None = None, radius_km: float = 5,
     return {"postal_code": z, "stores": stores, "note": DISTANCE_NOTE}
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def show_stores_map(zip_code: str | None = None, radius_km: float = 3,
                           brand: str | None = None, limit: int = 8,
                           ctx: Context | None = None) -> list:
@@ -224,7 +280,7 @@ async def show_stores_map(zip_code: str | None = None, radius_km: float = 3,
             {"postal_code": z, "image_file": str(path), "stores": legend, "note": DISTANCE_NOTE}]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_store_details(store_id: str) -> dict:
     """Details for one store (by store_id): address, today's hours, facilities, map link.
     Includes distance if the user's postal code is known."""

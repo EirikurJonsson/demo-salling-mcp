@@ -16,6 +16,40 @@ def test_within_tolerance_empty():
     assert pricing.within_tolerance([], 0.2) == []
 
 
+def test_parse_size_units_and_multipacks():
+    assert pricing.parse_size("HAKKET OKSEKØD 8-12% 500 G") == (0.5, "kg")
+    assert pricing.parse_size("Yoghurt 4 x 125 g") == (0.5, "kg")
+    assert pricing.parse_size("Sødmælk 1,5 L") == (1.5, "l")
+    assert pricing.parse_size("Fløde 38% 2,5 dl") == (0.25, "l")
+    assert pricing.parse_size("Æg 10 stk") == (10, "stk")
+    assert pricing.parse_size("Sødmælk 3,5%") is None
+    assert pricing.parse_size(None) is None
+
+
+def test_trim_product_adds_unit_price():
+    out = pricing.trim_product({"prod_id": "1", "description": "Oksekød 500 g", "price": 45.0})
+    assert out["unit_price"] == 90.0 and out["unit"] == "kg"
+    assert "unit_price" not in pricing.trim_product({"description": "Oksekød", "price": 45.0})
+
+
+def test_within_tolerance_compares_per_kg_when_sizes_known():
+    raw = [{"prod_id": "small", "description": "Oksekød 250 g", "price": 30.0},
+           {"prod_id": "mid", "description": "Oksekød 500 g", "price": 45.0},
+           {"prod_id": "big", "description": "Oksekød 1 kg", "price": 80.0},
+           {"prod_id": "nosize", "description": "Oksekød", "price": 10.0}]
+    out = pricing.within_tolerance([pricing.trim_product(r) for r in raw], 0.2)
+    assert [o["product_id"] for o in out] == ["big", "mid"]  # 80 and 90 kr/kg; 120 kr/kg is out
+    assert pricing.price_summary(out)["compared_on"] == "price per kg"
+
+
+def test_within_tolerance_falls_back_to_pack_price_with_one_size():
+    raw = [{"prod_id": "a", "description": "Løg 1 kg", "price": 12.0},
+           {"prod_id": "b", "description": "Løg", "price": 10.0}]
+    out = pricing.within_tolerance([pricing.trim_product(r) for r in raw], 0.2)
+    assert [o["product_id"] for o in out] == ["b", "a"]
+    assert pricing.price_summary(out)["compared_on"] == "pack price"
+
+
 def test_price_summary_picks_middle_as_suggested():
     s = pricing.price_summary([p(10), p(11), p(12)])
     assert s["cheapest"] == 10 and s["suggested"]["price"] == 11

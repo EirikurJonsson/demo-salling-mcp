@@ -1,33 +1,80 @@
 import math
 import re
+from collections import Counter
 from datetime import date
 from typing import Any
 
+# unit -> (base unit, factor to base)
+_UNITS = {"kg": ("kg", 1.0), "g": ("kg", 0.001), "gr": ("kg", 0.001),
+          "l": ("l", 1.0), "ltr": ("l", 1.0), "dl": ("l", 0.1), "cl": ("l", 0.01),
+          "ml": ("l", 0.001), "stk": ("stk", 1.0)}
+_SIZE_RE = re.compile(r"(?:(\d+)\s*[x×]\s*)?(\d+(?:[.,]\d+)?)\s*(kg|gr|g|ltr|dl|cl|ml|l|stk)\b",
+                      re.IGNORECASE)
+
+
+def parse_size(text: str | None) -> tuple[float, str] | None:
+    """Pack size from a product title, as (amount in base unit, base unit).
+    '4 x 125 g' -> (0.5, 'kg'), '1,5 L' -> (1.5, 'l'), '10 stk' -> (10, 'stk')."""
+    m = _SIZE_RE.search(text or "")
+    if not m:
+        return None
+    count = int(m.group(1)) if m.group(1) else 1
+    base, factor = _UNITS[m.group(3).lower()]
+    amount = count * float(m.group(2).replace(",", ".")) * factor
+    return (amount, base) if amount > 0 else None
+
 
 def trim_product(p: dict) -> dict:
-    return {
+    title = p.get("description") or p.get("title")
+    out = {
         "product_id": p.get("prod_id"),
-        "title": p.get("description") or p.get("title"),
+        "title": title,
         "price": p.get("price"),
         "link": p.get("link"),
     }
+    size = parse_size(f"{p.get('title') or ''} {p.get('description') or ''}")
+    if size and isinstance(out["price"], (int, float)):
+        out["unit_price"] = round(out["price"] / size[0], 2)
+        out["unit"] = size[1]
+    return out
+
+
+def comparison_unit(products: list[dict]) -> str | None:
+    """Unit to compare on ('kg', 'l', 'stk'), or None to compare pack prices.
+    Unit prices are used when at least two priced products share a unit."""
+    counts = Counter(p["unit"] for p in products
+                     if isinstance(p.get("price"), (int, float)) and p.get("unit"))
+    if not counts:
+        return None
+    unit, n = counts.most_common(1)[0]
+    return unit if n >= 2 else None
 
 
 def within_tolerance(products: list[dict], tolerance: float = 0.2) -> list[dict]:
-    """Products priced within `tolerance` above the cheapest, sorted by price."""
+    """Products within `tolerance` above the cheapest, sorted cheapest first.
+
+    Compares price per kg/l/stk when pack sizes can be read from titles (so a 1 kg
+    pack at 80 kr beats a 250 g pack at 30 kr); otherwise compares pack prices.
+    Products whose size is unknown or in another unit are left out of a unit comparison.
+    """
     priced = [p for p in products if isinstance(p.get("price"), (int, float))]
+    unit = comparison_unit(priced)
+    if unit:
+        priced = [p for p in priced if p.get("unit") == unit]
+    key = (lambda p: p["unit_price"]) if unit else (lambda p: p["price"])
     if not priced:
         return []
-    cheapest = min(p["price"] for p in priced)
-    limit = cheapest * (1 + tolerance)
-    return sorted((p for p in priced if p["price"] <= limit), key=lambda p: p["price"])
+    limit = min(key(p) for p in priced) * (1 + tolerance)
+    return sorted((p for p in priced if key(p) <= limit), key=key)
 
 
 def price_summary(options: list[dict]) -> dict:
     if not options:
         return {"found": False, "options": []}
+    unit = comparison_unit(options)
     return {
         "found": True,
+        "compared_on": f"price per {unit}" if unit else "pack price",
         "cheapest": options[0]["price"],
         "suggested": options[len(options) // 2],
         "options": options,
