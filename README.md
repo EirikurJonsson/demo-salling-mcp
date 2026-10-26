@@ -1,9 +1,9 @@
 # salling-mcp
 
 > **⚠️ Unofficial hobby project.** This is **not** made, endorsed, supported or affiliated
-> with Salling Group (Netto, føtex, Bilka, Salling) in any way. I built it for fun and to
-> learn about MCP servers. It only uses Salling Group's public developer APIs, with my own
-> free API key. "Salling Group", "Netto", "føtex" and "Bilka" are their trademarks.
+> with Salling Group (Netto, føtex, Bilka, Salling) in any way. I built it for fun. It only
+> uses Salling Group's public developer APIs, with my own free API key. "Salling Group",
+> "Netto", "føtex" and "Bilka" are their trademarks.
 >
 > Use it at your own risk: prices, stores and opening hours may be wrong or out of date.
 > Always check with the store. Please don't contact Salling Group about this project.
