@@ -16,7 +16,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from salling_mcp import mapimage, pricing
-from salling_mcp.client import SallingAPIError, SallingClient
+from salling_mcp.client import SallingAPIError, SallingClient, default_cache_path
 from salling_mcp.models import (
     FoodWasteResult,
     PostalCodeResult,
@@ -36,7 +36,7 @@ _client: SallingClient | None = None
 def client() -> SallingClient:
     global _client
     if _client is None:
-        _client = SallingClient()
+        _client = SallingClient(cache_path=default_cache_path())
     return _client
 
 
@@ -69,6 +69,9 @@ MAX_FOOD_WASTE_STORES = 3
 STORE_FETCH_PAGE = 50
 MAX_OTHER_MATCHES = 5
 MAX_FALLBACK_SEARCHES = 2
+# The product API allows 100 calls a day, so one request gets a small search budget.
+MAX_INGREDIENTS = 10
+MAX_SEARCHES_PER_CALL = 15
 MAX_RADIUS_KM = 50
 MAX_LIST_LIMIT = 50
 MAX_MAP_STORES = 20
@@ -172,6 +175,12 @@ async def price_ingredients(ingredients: list[str | Ingredient], price_tolerance
     Bilka, since prices are Bilka ToGo prices) and discounted near-expiry items matching
     the ingredients in nearby stores.
 
+    The product API has a small daily quota (100 calls), so pass at most 10 ingredients per
+    call: price the items that cost money (meat, fish, cheese, drinks, specialty items) and
+    estimate cheap staples (salt, oil, flour, spices) yourself. Do not call this again with
+    the same ingredients; results are cached. Fallback searches are limited per call and
+    unpriced items show 'found': false.
+
     Search is fuzzy: always check option titles match the ingredient (e.g. a search for
     'parmesan' may return other cheeses) and retry with a different term if not.
     """
@@ -179,9 +188,16 @@ async def price_ingredients(ingredients: list[str | Ingredient], price_tolerance
     wanted = [w.model_copy(update={"term": w.term.strip()}) for w in wanted if w.term.strip()]
     if not wanted:
         raise ToolError("ingredients must not be empty")
+    if len(wanted) > MAX_INGREDIENTS:
+        raise ToolError(
+            f"Too many ingredients ({len(wanted)}); the product API has a daily quota. Pass at most "
+            f"{MAX_INGREDIENTS}: price the costly items and estimate cheap staples yourself.")
     _check_range("price_tolerance", price_tolerance, 0, 2)
+    searches_left = MAX_SEARCHES_PER_CALL
 
     async def search(term: str) -> tuple[list[dict], list[dict], list[dict]]:
+        nonlocal searches_left
+        searches_left -= 1
         found = [pricing.trim_product(p) for p in await client().relevant_products(term)]
         return (*pricing.split_by_match(found, term), found)
 
@@ -190,6 +206,8 @@ async def price_ingredients(ingredients: list[str | Ingredient], price_tolerance
             best, others, found = await search(item.term)
             searched_as = item.term
             for word in [] if best else pricing.fallback_terms(item.term)[:MAX_FALLBACK_SEARCHES]:
+                if searches_left <= 0:
+                    break
                 best, others, _ = await search(word)
                 if best:
                     searched_as = word

@@ -52,6 +52,12 @@ cp .env.example .env   # then put your key in .env
 
 `.env` is git-ignored. Do not commit your key.
 
+**API limits:** the product and food-waste APIs allow 100 calls a day. The server caches
+answers on disk (default `~/.cache/salling-mcp/cache.sqlite`, set `SALLING_CACHE_PATH` to
+move it, or `off` to keep the cache in memory only), sends those calls one at a time, and
+stops at 90 a day. A block from the API is remembered across restarts. A recipe is limited
+to 10 priced ingredients, so the agent should price costly items and estimate staples.
+
 ## Use it with an MCP client
 
 The server talks over stdio:

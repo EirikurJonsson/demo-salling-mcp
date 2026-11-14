@@ -14,7 +14,7 @@ from salling_mcp.client import BASE_URL, SallingAPIError, SallingClient
 
 @pytest.fixture(autouse=True)
 def fake_client(monkeypatch):
-    c = SallingClient(api_key="test-key", retry_delay=0)
+    c = SallingClient(api_key="test-key", retry_delay=0, min_gap=0)
     monkeypatch.setattr(server, "_client", c)
     monkeypatch.setattr(server, "_remember_zip", True)  # as when run over stdio
     monkeypatch.setattr(server, "_saved_zip", None)
@@ -215,7 +215,7 @@ async def test_retries_network_errors():
 
 
 @respx.mock
-async def test_concurrent_requests_are_capped(fake_client):
+async def test_product_requests_are_sent_one_at_a_time(fake_client):
     active = peak = 0
 
     async def slow(request):
@@ -226,8 +226,17 @@ async def test_concurrent_requests_are_capped(fake_client):
         active -= 1
         return httpx.Response(200, json=MILK)
     respx.get(f"{BASE_URL}/v1/product-suggestions/relevant-products").mock(side_effect=slow)
-    await server.price_ingredients([f"vare{i}" for i in range(12)])
-    assert peak == 4
+    await server.price_ingredients([f"vare{i}" for i in range(10)])
+    assert peak == 1  # the product API has spike protection and a daily quota
+
+
+@respx.mock
+async def test_too_many_ingredients_makes_no_api_calls(fake_client):
+    route = respx.get(f"{BASE_URL}/v1/product-suggestions/relevant-products").mock(
+        return_value=httpx.Response(200, json=MILK))
+    with pytest.raises(ToolError, match="Too many ingredients"):
+        await server.price_ingredients([f"vare{i}" for i in range(server.MAX_INGREDIENTS + 1)])
+    assert route.call_count == 0
 
 
 @respx.mock

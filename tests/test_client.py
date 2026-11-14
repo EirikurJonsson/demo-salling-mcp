@@ -1,3 +1,5 @@
+import asyncio
+
 import httpx
 import pytest
 import respx
@@ -10,7 +12,7 @@ STORES = f"{BASE_URL}/v2/stores"
 
 @pytest.fixture
 def c():
-    return SallingClient(api_key="k", retry_delay=0)
+    return SallingClient(api_key="k", retry_delay=0, min_gap=0)
 
 
 @respx.mock
@@ -28,6 +30,7 @@ async def test_repeated_calls_are_cached(c):
 async def test_cache_expires(c, monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(client_mod.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(client_mod.time, "time", lambda: now[0])
     route = respx.get(f"{BASE_URL}/v1/food-waste/").mock(return_value=httpx.Response(200, json=[]))
     await c.food_waste(zip_code="8000")
     now[0] += client_mod.TTL_FOOD_WASTE - 1
@@ -91,3 +94,82 @@ async def test_short_retry_after_is_still_retried(c):
         httpx.Response(429, headers={"Retry-After": "0"}), httpx.Response(200, json=[])])
     assert await c.stores(zip="8000") == []
     assert route.call_count == 2
+
+
+PRODUCTS = f"{BASE_URL}/v1/product-suggestions/relevant-products"
+
+
+@respx.mock
+async def test_cache_survives_restart(tmp_path):
+    db = tmp_path / "cache.sqlite"
+    route = respx.get(PRODUCTS).mock(return_value=httpx.Response(200, json={"suggestions": [{"id": 1}]}))
+    first = SallingClient(api_key="k", min_gap=0, cache_path=db)
+    await first.relevant_products("mælk")
+    await first.aclose()
+    second = SallingClient(api_key="k", min_gap=0, cache_path=db)
+    assert await second.relevant_products("mælk") == [{"id": 1}]
+    assert route.call_count == 1
+    await second.aclose()
+
+
+@respx.mock
+async def test_block_survives_restart(tmp_path):
+    db = tmp_path / "cache.sqlite"
+    route = respx.get(PRODUCTS).mock(return_value=httpx.Response(429, headers={"Retry-After": "3600"}))
+    first = SallingClient(api_key="k", min_gap=0, retry_delay=0, cache_path=db)
+    with pytest.raises(SallingAPIError, match="Rate limited"):
+        await first.relevant_products("mælk")
+    await first.aclose()
+    second = SallingClient(api_key="k", min_gap=0, retry_delay=0, cache_path=db)
+    with pytest.raises(SallingAPIError, match="Rate limited"):
+        await second.relevant_products("smør")
+    assert route.call_count == 1  # the restarted client did not call again
+    await second.aclose()
+
+
+@respx.mock
+async def test_quota_apis_are_called_one_at_a_time():
+    active = peak = 0
+
+    async def slow(request):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return httpx.Response(200, json={"suggestions": []})
+    respx.get(PRODUCTS).mock(side_effect=slow)
+    c = SallingClient(api_key="k", min_gap=0)
+    await asyncio.gather(*(c.relevant_products(f"v{i}") for i in range(6)))
+    assert peak == 1
+    await c.aclose()
+
+
+@respx.mock
+async def test_calls_are_spaced_by_min_gap(monkeypatch):
+    sleeps = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+        await real_sleep(0)
+    monkeypatch.setattr(client_mod.asyncio, "sleep", fake_sleep)
+    respx.get(PRODUCTS).mock(return_value=httpx.Response(200, json={"suggestions": []}))
+    c = SallingClient(api_key="k", min_gap=1.0)
+    await c.relevant_products("a")
+    await c.relevant_products("b")
+    assert len(sleeps) == 1 and 0 < sleeps[0] <= 1.0
+    await c.aclose()
+
+
+@respx.mock
+async def test_daily_budget_stops_calls_before_the_quota():
+    route = respx.get(PRODUCTS).mock(return_value=httpx.Response(200, json={"suggestions": []}))
+    c = SallingClient(api_key="k", min_gap=0, daily_budget=2)
+    await c.relevant_products("a")
+    await c.relevant_products("b")
+    with pytest.raises(SallingAPIError, match="Daily call budget"):
+        await c.relevant_products("c")
+    assert route.call_count == 2
+    await c.relevant_products("a")  # cached answers are still free
+    await c.aclose()

@@ -34,13 +34,25 @@ Two main flows:
 ```
 src/salling_mcp/
   server.py     # MCPServer app, tool and prompt definitions (thin)
-  client.py     # Salling Group HTTP client (all API calls, retries, cache)
+  client.py     # Salling Group HTTP client (all API calls, retries, cache, pacing, daily budget)
+  cache.py      # SQLite store: cached responses, call log and block state survive restarts
   pricing.py    # price tolerance, unit prices, packs, totals, opening hours (pure, unit tested)
   models.py     # TypedDict output schemas for the tools
   mapimage.py   # static PNG map of nearby stores (OSM tiles, small numbered dots)
 tests/          # test_protocol.py goes through a real MCP client
-skills/salling-group-api/SKILL.md   # API reference — read before touching client.py
+skills/salling-group-api/SKILL.md      # API reference — read before touching client.py
+skills/salling-group-api/REFERENCE.md  # official-portal digest: quotas, spike protection, schemas
 ```
+
+## API limits (read REFERENCE.md §1 and §4)
+
+- Food Waste and Product Suggestions allow **100 calls/day** and have per-IP spike protection.
+  `client.py` sends their calls one at a time, spaced out, under a daily budget of 90, and
+  caches product results for 24 h on disk (`SALLING_CACHE_PATH`, `off` = memory only).
+- A long `Retry-After` on a 429 means quota used up or IP quarantined: stop calling until it
+  passes. The block is stored on disk so a restart does not forget it.
+- `price_ingredients` takes at most 10 ingredients and has a per-call search budget.
+- Never run live calls in a loop while developing; tests use `respx` only.
 
 ## Conventions
 
